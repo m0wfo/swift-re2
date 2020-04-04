@@ -7,7 +7,7 @@
 
 import Foundation
 
-class Regexp {
+class Regexp: Equatable {
 
     enum Op {
         case NO_MATCH // Matches no strings.
@@ -68,5 +68,51 @@ class Regexp {
         self.min = 0
         self.max = 0
         self.name = nil
+    }
+
+    static func == (lhs: Regexp, rhs: Regexp) -> Bool {
+        if lhs.op != rhs.op {
+            return false
+        }
+
+        var same = true
+
+        switch lhs.op {
+        case Op.END_TEXT:
+            // The parse flags remember whether this is \z or \Z.
+            if (lhs.flags & RE2.WAS_DOLLAR) == (rhs.flags & RE2.WAS_DOLLAR) {
+                same = true
+            }
+            break
+        case Op.LITERAL, Op.CHAR_CLASS:
+            if lhs.runes != rhs.runes {
+                same = false
+            }
+            break
+        case Op.ALTERNATE, Op.CONCAT:
+            same = lhs.subs.elementsEqual(rhs.subs)
+            break
+        case Op.STAR, Op.PLUS, Op.QUEST:
+            if (lhs.flags & RE2.NON_GREEDY) != (rhs.flags & RE2.NON_GREEDY) {
+                same = lhs.subs[0] == rhs.subs[0]
+            }
+            break
+        case Op.REPEAT:
+            if (lhs.flags & RE2.NON_GREEDY) != (rhs.flags & RE2.NON_GREEDY)
+                || lhs.min != rhs.min || lhs.max != rhs.max || lhs.subs[0] != rhs.subs[0] {
+                same = false
+            }
+            break
+        case Op.CAPTURE:
+            if lhs.cap != rhs.cap || (lhs.name == nil ? rhs.name != nil : lhs.name != rhs.name)
+                || lhs.subs[0] != rhs.subs[0] {
+                same = false
+            }
+            break
+        default:
+            break
+        }
+
+        return same
     }
 }

@@ -109,28 +109,30 @@ fileprivate class StringIterator {
     }
 }
 
-public class PatternSyntaxError: Error {
+public enum PatternSyntaxError: Error {
+    case invalidRepeatOp
+    case missingRepeatArgument
 }
 
 class Parser {
 
-    // Unexpected error
-    private static let ERR_INTERNAL_ERROR: String = "regexp/syntax: internal error"
-
-    // Parse errors
-    private static let ERR_INVALID_CHAR_CLASS: String = "invalid character class"
-    private static let ERR_INVALID_CHAR_RANGE: String = "invalid character class range"
-    private static let ERR_INVALID_ESCAPE: String = "invalid escape sequence"
-    private static let ERR_INVALID_NAMED_CAPTURE: String = "invalid named capture"
-    private static let ERR_INVALID_PERL_OP: String = "invalid or unsupported Perl syntax"
-    private static let ERR_INVALID_REPEAT_OP: String = "invalid nested repetition operator"
-    private static let ERR_INVALID_REPEAT_SIZE: String = "invalid repeat count"
-    private static let ERR_MISSING_BRACKET: String = "missing closing ]"
-    private static let ERR_MISSING_PAREN: String = "missing closing )"
-    private static let ERR_MISSING_REPEAT_ARGUMENT: String =
-        "missing argument to repetition operator"
-    private static let ERR_TRAILING_BACKSLASH: String = "trailing backslash at end of expression"
-    private static let ERR_DUPLICATE_NAMED_CAPTURE: String = "duplicate capture group name"
+//    // Unexpected error
+//    private static let ERR_INTERNAL_ERROR: String = "regexp/syntax: internal error"
+//
+//    // Parse errors
+//    static let ERR_INVALID_CHAR_CLASS: String = "invalid character class"
+//    static let ERR_INVALID_CHAR_RANGE: String = "invalid character class range"
+//    private static let ERR_INVALID_ESCAPE: String = "invalid escape sequence"
+//    private static let ERR_INVALID_NAMED_CAPTURE: String = "invalid named capture"
+//    private static let ERR_INVALID_PERL_OP: String = "invalid or unsupported Perl syntax"
+//    static let ERR_INVALID_REPEAT_OP: String = "invalid nested repetition operator"
+//    private static let ERR_INVALID_REPEAT_SIZE: String = "invalid repeat count"
+//    private static let ERR_MISSING_BRACKET: String = "missing closing ]"
+//    private static let ERR_MISSING_PAREN: String = "missing closing )"
+//    private static let ERR_MISSING_REPEAT_ARGUMENT: String =
+//        "missing argument to repetition operator"
+//    private static let ERR_TRAILING_BACKSLASH: String = "trailing backslash at end of expression"
+//    private static let ERR_DUPLICATE_NAMED_CAPTURE: String = "duplicate capture group name"
 
 
     private let wholeRegexp: String
@@ -181,7 +183,7 @@ class Parser {
             i = i - 1
         } while i > 0 && stack[i - 1].op.isPseudo()
         let r = Array(stack[i...n])
-        stack.removeSubrange(i..<n)
+        stack.removeSubrange(i...n)
         return r
     }
 
@@ -312,7 +314,7 @@ class Parser {
     // Pre: t is positioned after the initial repetition operator.
     // Post: t advances past an optional perl-mode '?', or stays put.
     //       Or, it fails with PatternSyntaxException
-    private func repeatR(op: Regexp.Op, min: Int, max: Int, beforePos: Int, t: StringIterator, lastRepeatPos: Int) throws {
+    private func repeatR(op: Regexp.Op, min: Int32, max: Int32, beforePos: Int, t: StringIterator, lastRepeatPos: Int) throws {
         var flags = self.flags
         if (flags & RE2.PERL_X) != 0 {
             if t.more() && t.lookingAt("?") {
@@ -323,13 +325,297 @@ class Parser {
                 // In Perl it is not allowed to stack repetition operators:
                 // a** is a syntax error, not a doubled star, and a++ means
                 // something else entirely, which we don't support!
-                throw PatternSyntaxError()
+                throw PatternSyntaxError.invalidRepeatOp
             }
         }
         let n = stack.count
         if n == 0 {
-            throw PatternSyntaxError()
+            throw PatternSyntaxError.missingRepeatArgument
+        }
+        let sub = stack[n - 1]
+        if sub.op.isPseudo() {
+            throw PatternSyntaxError.missingRepeatArgument
+        }
+        let re = newRegexp(op)
+        re.min = min
+        re.max = max
+        re.flags = flags
+        re.subs = [sub]
+        stack[n - 1] = re
+    }
+
+    // concat replaces the top of the stack (above the topmost '|' or '(') with
+    // its concatenation.
+    private func concat() -> Regexp {
+        maybeConcat(r: -1, flags: 0)
+
+        // Scan down to find pseudo-operator | or (.
+        let subs = popToPseudo()
+
+        // Empty concatenation is special case.
+        if subs.isEmpty {
+            return push(newRegexp(Regexp.Op.EMPTY_MATCH))!
         }
 
+        return push(collapse(subs, op: Regexp.Op.CONCAT))!
+    }
+
+    // TODO
+    // alternate()
+    // cleanAlt()
+
+    // collapse returns the result of applying op to subs[start:end].
+    // If (sub contains op nodes, they all get hoisted up
+    // so that there is never a concat of a concat or an
+    // alternate of an alternate.
+    private func collapse(_ subs: [Regexp], op: Regexp.Op) -> Regexp {
+        if subs.count == 1 {
+            return subs[0]
+        }
+
+        // Concatenate subs iff op is same.
+        // Compute length in first pass.
+        var len = 0
+        for sub in subs {
+            len += (sub.op == op) ? sub.subs.count : 1
+        }
+        var newSubs: [Regexp] = Array()
+        var i = 0
+        for sub in subs {
+            if sub.op == op {
+                newSubs += subs[0...i]
+                i = i + sub.subs.count
+                reuse(sub)
+            } else {
+                newSubs[i+1] = sub
+            }
+        }
+
+        var re = newRegexp(op)
+        re.subs = newSubs
+
+        if op == Regexp.Op.ALTERNATE {
+            re.subs = factor(&re.subs, re.flags)
+            if re.subs.count == 1 {
+                let old = re
+                re = re.subs[0]
+                reuse(old)
+            }
+        }
+
+        return re
+    }
+
+    // factor factors common prefixes from the alternation list sub.  It
+    // returns a replacement list that reuses the same storage and frees
+    // (passes to p.reuse) any removed *Regexps.
+    //
+    // For example,
+    //     ABC|ABD|AEF|BCX|BCY
+    // simplifies by literal prefix extraction to
+    //     A(B(C|D)|EF)|BC(X|Y)
+    // which simplifies by character class introduction to
+    //     A(B[CD]|EF)|BC[XY]
+    //
+    private func factor(_ exprs: inout [Regexp], _ flags: Int32) -> [Regexp] {
+        if exprs.count < 2 {
+            return exprs
+        }
+
+        // Swift's Array Slices are more akin to Go's slices, so
+        // we deviate from the Java implementation somewhat in this next bit
+        var s = 0
+        var lensub = exprs.count
+        var lenout = 0
+
+        // Round 1: Factor out common literal prefixes.
+        // Note: (str, strlen) and (istr, istrlen) are like Go slices
+        // onto a prefix of some Regexp's runes array (hence offset=0).
+        var str: [Int32]? = nil
+        var strlen = 0
+        var strflags: Int32 = 0
+        var start = 0
+
+        var i = 0
+        repeat {
+            // Invariant: the Regexps that were in sub[0:start] have been
+            // used or marked for reuse, and the slice space has been reused
+            // for out (len <= start).
+            //
+            // Invariant: sub[start:i] consists of regexps that all begin
+            // with str as modified by strflags.
+            var istr: [Int32]? = nil
+            var istrlen = 0
+            var iflags: Int32 = 0
+
+            if i < lensub {
+                var re = exprs[s + i]
+                if re.op == Regexp.Op.CONCAT && re.subs.count > 0 {
+                    re = re.subs[0]
+                }
+                if re.op == Regexp.Op.LITERAL {
+                    istr = re.runes
+                    istrlen = re.runes.count
+                    iflags = re.flags & RE2.FOLD_CASE
+                }
+
+                // istr is the leading literal string that re begins with.
+                // The string refers to storage in re or its children.
+                if iflags == strflags {
+                    var same = 0
+                    repeat {
+                        same += 1
+                    } while same < strlen && same < istrlen && str![same] == istr![same]
+                    if same > 0 {
+                        // Matches at least one rune in current range.
+                        // Keep going around.
+                        strlen = same
+                        continue
+                    }
+                }
+            }
+
+            // Found end of a run with common leading literal string:
+            // sub[start:i] all begin with str[0:strlen], but sub[i]
+            // does not even begin with str[0].
+            //
+            // Factor out common string and append factored expression to out.
+            if i == start {
+                // Nothing to do - run of length 0.
+            } else if i == start + 1 {
+                // Just one: don't bother factoring.
+                lenout += 1
+                exprs[lenout] = exprs[s + start]
+            } else {
+                // Construct factored form: prefix(suffix1|suffix2|...)
+                let prefix = newRegexp(Regexp.Op.LITERAL)
+                prefix.flags = strflags
+                prefix.runes = Array(str![0...strlen])
+
+                var j = start
+                repeat {
+                    exprs[s + j] = removeLeadingString(&exprs[s + j], strlen)
+                    j += 1
+                } while j < i
+
+                // Recurse.
+                let suffix = collapse(Array(exprs[s+start...s+i]), op: Regexp.Op.ALTERNATE)
+                let re = newRegexp(Regexp.Op.CONCAT)
+                re.subs = [prefix, suffix]
+                lenout += 1
+                exprs[lenout] = re
+            }
+
+            // Prepare for next iteration.
+            start = i
+            str = istr
+            strlen = istrlen
+            strflags = iflags
+
+            i += 1
+        } while i <= lensub
+
+        lensub = lenout
+        s = 0
+
+        // Round 2: Factor out common complex prefixes,
+        // just the first piece of each concatenation,
+        // whatever it is.  This is good enough a lot of the time.
+        start = 0
+        lenout = 0
+        var first: Regexp? = nil
+
+        i = 0
+        repeat {
+            // Invariant: the Regexps that were in sub[0:start] have been
+            // used or marked for reuse, and the slice space has been reused
+            // for out (lenout <= start).
+            //
+            // Invariant: sub[start:i] consists of regexps that all begin with
+            // ifirst.
+            var ifirst: Regexp? = nil
+            if i < lensub {
+                ifirst = leadingRegexp(exprs[s + i])
+                if first != nil && ifirst != nil {
+                    if first == ifirst {
+                        continue
+                    }
+                }
+            }
+
+            // Found end of a run with common leading regexp:
+            // sub[start:i] all begin with first but sub[i] does not.
+            //
+            // Factor out common regexp and append factored expression to out.
+            if i == start {
+                // Nothing to do - run of length 0
+            } else if i == start + 1 {
+                lenout += 1
+                // Just one: don't bother factoring.
+                exprs[lenout] = exprs[s + start]
+            } else {
+                // Construct factored form: prefix(suffix1|suffix2|...)
+                let prefix = first
+                repeat {
+
+                }
+            }
+
+            // Prepare for next iteration.
+            start = i
+            first = ifirst
+
+            i += 1
+        } while i < lensub
+    }
+
+    // removeLeadingString removes the first n leading runes
+    // from the beginning of re.  It returns the replacement for re.
+    private func removeLeadingString(_ re: inout Regexp, _ n: Int) -> Regexp {
+        if re.op == Regexp.Op.CONCAT && !re.subs.isEmpty {
+            // Removing a leading string in a concatenation
+            // might simplify the concatenation.
+            let sub = removeLeadingString(&re.subs[0], n)
+            re.subs[0] = sub
+            if sub.op == Regexp.Op.EMPTY_MATCH {
+                reuse(sub)
+                switch re.subs.count {
+                case 0:
+                    break
+                case 1:
+                    // Impossible but handle.
+                    re.op = Regexp.Op.EMPTY_MATCH
+                    break
+                case 2:
+                    do {
+                        let old = re
+                        re = re.subs[1]
+                        reuse(old)
+                        break
+                    }
+                default:
+                    re.subs = Array(re.subs[1..<re.subs.count])
+                    break
+                }
+            }
+        }
+        return re
+    }
+
+    // leadingRegexp returns the leading regexp that re begins with.
+    // The regexp refers to storage in re or its children
+    private func leadingRegexp(_ re: Regexp) -> Regexp? {
+        if re.op == Regexp.Op.EMPTY_MATCH {
+            return nil
+        }
+
+        if re.op == Regexp.Op.CONCAT && re.subs.count > 0 {
+            let sub = re.subs[0]
+            if sub.op == Regexp.Op.EMPTY_MATCH {
+                return nil
+            }
+            return sub
+        }
+        return re
     }
 }
