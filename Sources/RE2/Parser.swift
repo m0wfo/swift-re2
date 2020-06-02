@@ -557,7 +557,7 @@ class Parser {
                 // Construct factored form: prefix(suffix1|suffix2|...)
                 let prefix = first
                 repeat {
-
+                    // HERE (phase 2?)
                 }
             }
 
